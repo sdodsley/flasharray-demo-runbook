@@ -50,3 +50,7 @@ Validated on 31 October 2026 against a two-array fleet on Purity//FA 6.10.6 (RES
 
 - Nothing in this repository holds credentials; the playbook reads `PUREFA_URL` and `PUREFA_API` from the environment and generates its throwaway key pair under `~/.everpure-demo`.
 - `pause` needs a real terminal. Run the demo from a foreground shell, or pass `-e demo_pause=false`.
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE).
