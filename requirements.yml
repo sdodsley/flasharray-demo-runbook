@@ -1,0 +1,4 @@
+---
+collections:
+  - name: everpure.flasharray
+    version: ">=1.46.0"

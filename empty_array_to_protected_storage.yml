@@ -1,0 +1,739 @@
+---
+# =============================================================================
+# From an empty array to protected, fleet-placed storage in eight steps
+# =============================================================================
+# Live demo playbook for everpure.flasharray 1.46.0+
+#   (purefa_metrics is new in 1.46.0. Ansible resolves every module when it
+#    loads the play, so an older collection refuses to parse this file at all,
+#    whatever --tags you pass.)
+# Target: Everpure Cloud Dedicated trial or a lab FlashArray
+#         REST 2.40 or later, i.e. Purity//FA newer than 6.8.2
+#         (purefa_workload needs 2.40; realms and access policies 2.36,
+#          fleets 2.38, the OpenMetrics exporter Purity//FA 6.7)
+#
+#   1  Discover   purefa_info                       inventory the array
+#   2  Identity   purefa_apiclient                  API client for the app team
+#   3  Tenant     purefa_realm, purefa_pod,         realm for the app team, a pod
+#                 purefa_policy_management_access   inside it, and the realm-scoped
+#                                                   access policy
+#   4  Hosts      purefa_host, purefa_hg            hosts and host group
+#   5  Volume     purefa_volume, purefa_hg          create and connect
+#   6  Protect    purefa_pg, purefa_pgsched,        protection group, schedule,
+#                 purefa_pgsnap                     snapshot
+#   7  Fleet      purefa_fleet, purefa_preset,      a workload preset and a Fusion
+#                 purefa_workload                   workload built from it
+#   8  Verify     purefa_info, purefa_audits,       read back, audit trail,
+#                 purefa_metrics                    metrics
+#
+# Three details worth knowing before you present:
+#
+#   * The scoped access policy is created in step 3, straight after the realm.
+#     A policy scoped to a realm cannot exist before the realm does.
+#   * Volumes and protection groups cannot sit directly in a realm. The array
+#     refuses "realm::name" without a pod, so step 3 also creates a pod inside
+#     the realm and steps 5 and 6 build in it: realm::pod::name. Hosts and host
+#     groups live directly in the realm: realm::name.
+#   * Step 7 creates a minimal workload preset with purefa_preset (two data
+#     volumes, no replication) and deploys a workload from it, unless
+#     demo_preset names a preset that already exists in the fleet. Set
+#     demo_storage_class to a Fusion storage class a fleet member offers
+#     (flasharray-x for //X, flasharray-c for //C); otherwise the placement
+#     recommendation fails with "No viable targets".
+#
+# Requirements
+#   ansible-galaxy collection install 'everpure.flasharray:>=1.46.0'
+#   pip install "py-pure-client>=1.88.0" netaddr requests pycountry pytz urllib3 distro
+#     (the collection's requirements.txt; this demo itself imports only
+#      py-pure-client and pytz, the latter for purefa_audits)
+#   openssl on the controller (step 2 generates a throwaway key pair)
+#
+# Authentication (read by every module, so no per-task credentials)
+#   export PUREFA_URL=<array management address>
+#   export PUREFA_API=<array_admin API token>
+#   For step 7 the token must belong to an identity every fleet member knows
+#   (a directory-service user). A local admin's token works for steps 1-6 and 8,
+#   but Fusion refuses it (403) for anything that spans the fleet, and the
+#   workload lookup and placement do.
+#
+# Usage
+#   ansible-playbook empty_array_to_protected_storage.yml                 # all eight steps
+#   ansible-playbook empty_array_to_protected_storage.yml --tags step3    # one step
+#   ansible-playbook empty_array_to_protected_storage.yml --tags step1,step8
+#   ansible-playbook empty_array_to_protected_storage.yml --tags teardown # reset for the next run
+#   ansible-playbook empty_array_to_protected_storage.yml -e demo_pause=false  # no pause between steps
+#   ansible-playbook empty_array_to_protected_storage.yml -e demo_preset=<name>
+#     (use an existing preset instead of creating one; bare name, e.g. gold,
+#      not fleet:gold)
+#
+# Steps are self-contained, so any of them can be run on its own once the
+# earlier steps have been run at least once. Teardown can be run repeatedly;
+# the one-member fleet step 7 may have created is deliberately left in place.
+# =============================================================================
+
+- name: Empty array to protected, fleet-placed storage
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # --- Tenant ---------------------------------------------------------
+    demo_realm: demo-app-team
+    demo_realm_quota: 5T           # needs a K/M/G/T/P suffix; a bare byte count is not accepted
+    demo_realm_bw_qos: 1G
+    demo_realm_iops_qos: 100K
+    demo_pod: app-data
+
+    # --- Identity -------------------------------------------------------
+    demo_api_client: demo-app-team-client
+    demo_issuer: demo-app-team-issuer
+    demo_api_client_role: storage_admin
+    demo_api_client_ttl: 3600      # seconds, 1-86400 (the module sends milliseconds to the array)
+    demo_policy: demo-app-team-storage
+    demo_key_dir: "{{ lookup('env', 'HOME') }}/.everpure-demo"
+
+    # --- Hosts and volumes ----------------------------------------------
+    demo_hosts:
+      - { name: app-host-01, iqn: "iqn.1994-05.com.redhat:demo-app-host-01" }
+      - { name: app-host-02, iqn: "iqn.1994-05.com.redhat:demo-app-host-02" }
+    demo_hostgroup: app-cluster
+    demo_volumes:
+      - { name: db-data-01, size: 100G }
+      - { name: db-log-01, size: 50G }
+
+    # --- Protection -----------------------------------------------------
+    # Deliberately not the factory schedule (3600 / 86400 / 4 / 7), which a
+    # new protection group already has; with those values step 6 reports ok.
+    demo_pgroup: db-protect
+    demo_snap_frequency: 3600      # seconds between snapshots (300 - 34560000)
+    demo_snap_keep_all_for: 172800 # seconds to keep every snapshot (1 - 34560000)
+    demo_snap_per_day: 6           # then this many per day (max 1440) ...
+    demo_snap_days: 14             # ... for this many days (max 4000)
+    demo_snapshot_suffix: demo-baseline
+
+    # --- Fleet ----------------------------------------------------------
+    demo_min_rest_version: "2.40"
+    demo_fleet_name: demo-fleet
+    demo_create_fleet: true        # create a one-member fleet if the array is standalone
+    demo_preset: ""                # bare name of an existing preset to use; empty means create demo_preset_name
+    demo_preset_name: demo-app-preset
+    demo_storage_class: flasharray-x        # Fusion storage class of the target member (flasharray-c for a //C)
+    demo_preset_volume_count: "2"           # strings: the preset API stores its numbers as text
+    demo_preset_volume_size: "10737418240"  # 10 GiB per volume
+    demo_workload: demo-app-workload
+    demo_workload_host: ""         # optional host to connect to every workload volume
+    demo_workload_parameters: []   # optional preset parameters, see purefa_workload
+
+    # --- Verify ---------------------------------------------------------
+    demo_audit_since: ""           # "YYYY-MM-DD HH:MM:SS" in UTC; empty means five minutes before this run began
+
+    # --- Presentation ---------------------------------------------------
+    demo_pause: true               # wait for Enter after every step to talk it through; -e demo_pause=false to run straight through
+
+    # --- Derived names (realm::pod::name for volumes and protection groups) ---
+    realm_pod: "{{ demo_realm }}::{{ demo_pod }}"
+    realm_hostgroup: "{{ demo_realm }}::{{ demo_hostgroup }}"
+    realm_pgroup: "{{ realm_pod }}::{{ demo_pgroup }}"
+    demo_host_fqn: "{{ demo_hosts | map(attribute='name') | map('regex_replace', '^', demo_realm ~ '::') | list }}"
+    demo_volume_fqn: "{{ demo_volumes | map(attribute='name') | map('regex_replace', '^', realm_pod ~ '::') | list }}"
+
+  pre_tasks:
+    - name: Check array credentials are in the environment
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'PUREFA_URL') | length > 0
+          - lookup('env', 'PUREFA_API') | length > 0
+        fail_msg: Set PUREFA_URL and PUREFA_API before running this playbook.
+        quiet: true
+      tags: [always]
+
+    # now(utc=true) returns a naive datetime whose .timestamp() is then read as
+    # local time, so it is off by the controller's UTC offset; the local now()
+    # has a correct .timestamp(). The five-minute pad covers array clock skew.
+    - name: Note when this run began, for the audit trail in step 8
+      ansible.builtin.set_fact:
+        audit_start: >-
+          {{ demo_audit_since
+             if demo_audit_since | length > 0
+             else '%Y-%m-%d %H:%M:%S' | ansible.builtin.strftime((now().timestamp() - 300) | int, utc=true) }}
+      tags: [always]
+
+  tasks:
+    # =========================================================================
+    # 1 · Discover
+    # =========================================================================
+    - name: Step 1 - Discover
+      tags: [step1, discover]
+      block:
+        # fleet, presets and workloads are gathered in step 7, after the fleet
+        # check; purefa_info cannot gather them on an array without Fusion.
+        - name: "1 · Discover | Inventory the array with purefa_info"
+          everpure.flasharray.purefa_info:
+            gather_subset:
+              - minimum
+              - hosts
+              - hgroups
+              - volumes
+              - pgroups
+              - pods
+              - realms
+              - policies
+              - clients
+          register: inventory
+
+        - name: "1 · Discover | Check the array can run this demo"
+          ansible.builtin.assert:
+            that:
+              - inventory.purefa_info.default.api_versions is version(demo_min_rest_version, '>=')
+            fail_msg: >-
+              py-pure-client negotiated REST {{ inventory.purefa_info.default.api_versions }} with
+              this array; workloads need {{ demo_min_rest_version }} or later. Upgrade Purity, or
+              py-pure-client if it is older than the array.
+            quiet: true
+
+        - name: "1 · Discover | What is on the array"
+          ansible.builtin.debug:
+            msg:
+              - "REST version : {{ inventory.purefa_info.default.api_versions }}"
+              - "Hosts        : {{ inventory.purefa_info.hosts | length }}"
+              - "Host groups  : {{ inventory.purefa_info.hgroups | length }}"
+              - "Volumes      : {{ inventory.purefa_info.volumes | length }}"
+              - "Prot. groups : {{ inventory.purefa_info.pgroups | length }}"
+              - "Pods         : {{ inventory.purefa_info.pods | length }}"
+              - "Realms       : {{ inventory.purefa_info.realms | default({}) | length }}"
+              - "API clients  : {{ inventory.purefa_info.clients | length }}"
+
+        - name: "1 · Discover | Pause"
+          ansible.builtin.pause:
+            prompt: "Step 1 · Discover done: the array is inventoried and meets the version floor. Press Enter for step 2 · Identity"
+          when: demo_pause | bool
+
+    # =========================================================================
+    # 2 · Identity
+    # =========================================================================
+    - name: Step 2 - Identity
+      tags: [step2, identity]
+      block:
+        - name: "2 · Identity | Create a local directory for the demo key pair"
+          ansible.builtin.file:
+            path: "{{ demo_key_dir }}"
+            state: directory
+            mode: "0700"
+
+        - name: "2 · Identity | Generate an RSA private key for the API client"
+          ansible.builtin.command:
+            argv: [openssl, genrsa, -out, "{{ demo_key_dir }}/{{ demo_api_client }}.pem", "2048"]
+            creates: "{{ demo_key_dir }}/{{ demo_api_client }}.pem"
+          register: new_key
+
+        # purefa_apiclient only reconciles 'enabled' on an existing client, so
+        # a regenerated key pair would leave the array holding the old public
+        # key. Drop the client and let the next tasks register the new key.
+        - name: "2 · Identity | Drop a stale API client when the key pair was regenerated"
+          everpure.flasharray.purefa_apiclient:
+            name: "{{ demo_api_client }}"
+            state: absent
+          when: new_key is changed  # noqa: no-handler
+
+        - name: "2 · Identity | Derive the public key"
+          ansible.builtin.command:
+            argv:
+              - openssl
+              - rsa
+              - -in
+              - "{{ demo_key_dir }}/{{ demo_api_client }}.pem"
+              - -pubout
+              - -out
+              - "{{ demo_key_dir }}/{{ demo_api_client }}.pub"
+            creates: "{{ demo_key_dir }}/{{ demo_api_client }}.pub"
+
+        - name: "2 · Identity | Register the API client on the array"
+          everpure.flasharray.purefa_apiclient:
+            name: "{{ demo_api_client }}"
+            issuer: "{{ demo_issuer }}"
+            role: "{{ demo_api_client_role }}"
+            token_ttl: "{{ demo_api_client_ttl }}"
+            public_key: "{{ lookup('ansible.builtin.file', demo_key_dir ~ '/' ~ demo_api_client ~ '.pub') }}"
+
+        - name: "2 · Identity | Pause"
+          ansible.builtin.pause:
+            prompt: >-
+              Step 2 · Identity done: a key pair was generated locally and the API client
+              registered on the array with its public key. Press Enter for step 3 · Tenant
+          when: demo_pause | bool
+
+    # =========================================================================
+    # 3 · Tenant
+    # =========================================================================
+    - name: Step 3 - Tenant
+      tags: [step3, tenant]
+      block:
+        - name: "3 · Tenant | Create a realm for the app team"
+          everpure.flasharray.purefa_realm:
+            name: "{{ demo_realm }}"
+            quota: "{{ demo_realm_quota }}"
+            bw_qos: "{{ demo_realm_bw_qos }}"
+            iops_qos: "{{ demo_realm_iops_qos }}"
+
+        # with_default_protection: false matters on an array that has a
+        # container default protection: the array would otherwise give the
+        # pod an auto-created, retention-locked protection group that no
+        # teardown can remove, and the pod could never be eradicated.
+        - name: "3 · Tenant | Create a pod inside the realm to hold volumes and protection groups"
+          everpure.flasharray.purefa_pod:
+            name: "{{ demo_pod }}"
+            realm: "{{ demo_realm }}"
+            with_default_protection: false
+
+        # Bind this policy to an identity with purefa_dsrole access_policy (an
+        # AD or LDAP group) or purefa_user access_policy (a local user) to give
+        # the app team its scoped role. If you bind one live, unbind it before
+        # the teardown deletes the policy.
+        - name: "3 · Tenant | Create the access policy scoped to the realm"
+          everpure.flasharray.purefa_policy_management_access:
+            name: "{{ demo_policy }}"
+            aggregation_strategy: least-common-permissions
+            rules:
+              - role: storage
+                scope: "{{ demo_realm }}"
+                resource_type: realms
+
+        - name: "3 · Tenant | Pause"
+          ansible.builtin.pause:
+            prompt: "Step 3 · Tenant done: the realm, a pod inside it and the realm-scoped access policy exist. Press Enter for step 4 · Hosts"
+          when: demo_pause | bool
+
+    # =========================================================================
+    # 4 · Hosts
+    # =========================================================================
+    - name: Step 4 - Hosts
+      tags: [step4, hosts]
+      block:
+        - name: "4 · Hosts | Create the hosts in the realm"
+          everpure.flasharray.purefa_host:
+            name: "{{ demo_realm }}::{{ item.name }}"
+            iqn:
+              - "{{ item.iqn }}"
+          loop: "{{ demo_hosts }}"
+          loop_control:
+            label: "{{ demo_realm }}::{{ item.name }}"
+
+        - name: "4 · Hosts | Create the host group and add the hosts"
+          everpure.flasharray.purefa_hg:
+            name: "{{ realm_hostgroup }}"
+            host: "{{ demo_host_fqn }}"
+
+        - name: "4 · Hosts | Pause"
+          ansible.builtin.pause:
+            prompt: "Step 4 · Hosts done: two hosts and their host group live in the realm. Press Enter for step 5 · Volume"
+          when: demo_pause | bool
+
+    # =========================================================================
+    # 5 · Volume
+    # =========================================================================
+    - name: Step 5 - Volume
+      tags: [step5, volume]
+      block:
+        - name: "5 · Volume | Create the volumes in the realm's pod"
+          everpure.flasharray.purefa_volume:
+            name: "{{ realm_pod }}::{{ item.name }}"
+            size: "{{ item.size }}"
+          loop: "{{ demo_volumes }}"
+          loop_control:
+            label: "{{ realm_pod }}::{{ item.name }} ({{ item.size }})"
+
+        - name: "5 · Volume | Connect the volumes to the host group"
+          everpure.flasharray.purefa_hg:
+            name: "{{ realm_hostgroup }}"
+            volume: "{{ demo_volume_fqn }}"
+
+        - name: "5 · Volume | Pause"
+          ansible.builtin.pause:
+            prompt: "Step 5 · Volume done: the volumes exist in the realm's pod and are connected to the host group. Press Enter for step 6 · Protect"
+          when: demo_pause | bool
+
+    # =========================================================================
+    # 6 · Protect
+    # =========================================================================
+    - name: Step 6 - Protect
+      tags: [step6, protect]
+      block:
+        - name: "6 · Protect | Create the protection group with the volumes in it"
+          everpure.flasharray.purefa_pg:
+            name: "{{ realm_pgroup }}"
+            volume: "{{ demo_volume_fqn }}"
+
+        - name: "6 · Protect | Set the snapshot schedule and retention"
+          everpure.flasharray.purefa_pgsched:
+            name: "{{ realm_pgroup }}"
+            schedule: snapshot
+            enabled: true
+            snap_frequency: "{{ demo_snap_frequency }}"
+            all_for: "{{ demo_snap_keep_all_for }}"
+            per_day: "{{ demo_snap_per_day }}"
+            days: "{{ demo_snap_days }}"
+
+        - name: "6 · Protect | Take the first snapshot now"
+          everpure.flasharray.purefa_pgsnap:
+            name: "{{ realm_pgroup }}"
+            suffix: "{{ demo_snapshot_suffix }}"
+
+        - name: "6 · Protect | Pause"
+          ansible.builtin.pause:
+            prompt: >-
+              Step 6 · Protect done: protection group with both volumes, a snapshot schedule
+              with retention, and a first snapshot. Press Enter for step 7 · Fleet
+          when: demo_pause | bool
+
+    # =========================================================================
+    # 7 · Fleet
+    # =========================================================================
+    - name: Step 7 - Fleet
+      tags: [step7, fleet]
+      block:
+        # purefa_info cannot gather the fleet subset on an array without
+        # Fusion; turn that traceback into a sentence.
+        - name: "7 · Fleet | Is this array in a fleet?"
+          block:
+            - name: "7 · Fleet | Read the fleet"
+              everpure.flasharray.purefa_info:
+                gather_subset: [fleet]
+              register: fleet_check
+          rescue:
+            - name: "7 · Fleet | Fusion is not enabled on this array"
+              ansible.builtin.fail:
+                msg: >-
+                  This array cannot list a fleet, so Fusion is not enabled here and step 7
+                  cannot run: {{ ansible_failed_result.msg | default('no detail') }}
+
+        - name: "7 · Fleet | Create a fleet, because this array is standalone"
+          everpure.flasharray.purefa_fleet:
+            name: "{{ demo_fleet_name }}"
+            state: create
+          when:
+            - fleet_check.purefa_info.fleet | default({}) | length == 0
+            - demo_create_fleet | bool
+
+        # A preset is the template a workload is built from: where it goes (a
+        # storage class), which volumes, and optionally QoS, snapshots and
+        # replication. Preset writes need the fleet-wide identity.
+        - name: "7 · Fleet | Create the demo preset"
+          everpure.flasharray.purefa_preset:
+            name: "{{ demo_preset_name }}"
+            workload_type: Custom
+            description: Data volumes for the app team demo
+            placement:
+              storage_class:
+                name: "{{ demo_storage_class }}"
+            volumes:
+              - name: data
+                count: "{{ demo_preset_volume_count }}"
+                provisioned_size: "{{ demo_preset_volume_size }}"
+          when: demo_preset | length == 0
+
+        - name: "7 · Fleet | List the presets the fleet offers"
+          everpure.flasharray.purefa_info:
+            gather_subset: [fleet, presets]
+          register: fleet_info
+
+        # The API names a preset <fleet>:<preset>; the workload module wants the
+        # bare name, so strip the prefix from both the list and demo_preset.
+        - name: "7 · Fleet | Choose the preset"
+          ansible.builtin.set_fact:
+            available_presets: >-
+              {{ fleet_info.purefa_info.presets | default({}) | list
+                 | map('regex_replace', '^[^:]+:', '') | list }}
+            workload_preset: >-
+              {{ (demo_preset | regex_replace('^[^:]+:', ''))
+                 if demo_preset | length > 0 else demo_preset_name }}
+
+        - name: "7 · Fleet | Check the preset exists"
+          ansible.builtin.assert:
+            that:
+              - workload_preset | length > 0
+              - workload_preset in available_presets
+            fail_msg: >-
+              {{ ("No workload preset named '" ~ workload_preset ~ "' in this fleet.")
+              if workload_preset | length > 0 else 'This fleet has no workload presets.' }}
+              Available: {{ available_presets | join(', ') | default('none', true) }}.
+              Pass -e demo_preset=<name> to use one of those.
+            quiet: true
+
+        - name: "7 · Fleet | Deploy a Fusion workload from the preset"
+          everpure.flasharray.purefa_workload:
+            name: "{{ demo_workload }}"
+            preset: "{{ workload_preset }}"
+            recommendation: true
+            host: "{{ demo_workload_host }}"
+            parameters: "{{ demo_workload_parameters | default(omit, true) }}"
+            wait: true
+            wait_timeout: 600
+          register: workload
+
+        - name: "7 · Fleet | Where Fusion placed it"
+          ansible.builtin.debug:
+            msg:
+              - "Workload : {{ workload.workload.name }}"
+              - "Preset   : {{ workload_preset }}"
+              - "Placed on: {{ workload.workload.context }}"
+              - "Status   : {{ workload.workload.status }}"
+              - "Volumes  : {{ workload.workload.volumes | default([]) | join(', ') }}"
+
+        - name: "7 · Fleet | Pause"
+          ansible.builtin.pause:
+            prompt: "Step 7 · Fleet done: a workload preset was created and Fusion placed a workload from it. Press Enter for step 8 · Verify"
+          when: demo_pause | bool
+
+    # =========================================================================
+    # 8 · Verify
+    # =========================================================================
+    - name: Step 8 - Verify
+      tags: [step8, verify]
+      block:
+        # The protection group snapshot is read from pgroups[...].snaps; the
+        # 'snapshots' subset is not needed and walks every volume snapshot on
+        # the array.
+        - name: "8 · Verify | Read back what the demo built"
+          everpure.flasharray.purefa_info:
+            gather_subset:
+              - hosts
+              - hgroups
+              - pgroups
+              - pods
+              - realms
+              - policies
+              - clients
+          register: verify
+
+        - name: "8 · Verify | Every step landed"
+          ansible.builtin.assert:
+            that:
+              - demo_api_client in verify.purefa_info.clients
+              - demo_realm in verify.purefa_info.realms
+              - realm_pod in verify.purefa_info.pods
+              - demo_policy in verify.purefa_info.policies
+              - demo_host_fqn | difference(verify.purefa_info.hosts.keys() | list) | length == 0
+              - realm_hostgroup in verify.purefa_info.hgroups
+              - verify.purefa_info.hgroups[realm_hostgroup].hosts | length == demo_hosts | length
+              - verify.purefa_info.hgroups[realm_hostgroup].vols | length == demo_volumes | length
+              - realm_pgroup in verify.purefa_info.pgroups
+              - verify.purefa_info.pgroups[realm_pgroup].volumes | length == demo_volumes | length
+              - verify.purefa_info.pgroups[realm_pgroup].snap_enabled | bool
+              - (realm_pgroup ~ '.' ~ demo_snapshot_suffix) in verify.purefa_info.pgroups[realm_pgroup].snaps
+            success_msg: >-
+              Realm {{ demo_realm }}, scoped policy, API client, {{ demo_hosts | length }} hosts,
+              host group, {{ demo_volumes | length }} connected volumes, and protection group with
+              schedule and snapshot are all in place.
+
+        # purefa_apiclient returns nothing but changed; the identifiers the app
+        # team needs to mint ID tokens come from purefa_info.
+        - name: "8 · Verify | What the app team needs to mint ID tokens"
+          ansible.builtin.debug:
+            msg:
+              - "client_id (aud): {{ verify.purefa_info.clients[demo_api_client].client_id }}"
+              - "key_id    (kid): {{ verify.purefa_info.clients[demo_api_client].key_id }}"
+              - "issuer    (iss): {{ verify.purefa_info.clients[demo_api_client].issuer }}"
+              - "token TTL      : {{ verify.purefa_info.clients[demo_api_client].access_token_ttl_seconds | int }} s"
+              - "private key    : {{ demo_key_dir }}/{{ demo_api_client }}.pem"
+
+        # Fusion may place the workload on another fleet member, so read the result
+        # step 7 returned rather than asking this array to list it.
+        - name: "8 · Verify | The workload is ready (when step 7 ran in this run)"
+          ansible.builtin.assert:
+            that:
+              - workload.workload.status == 'ready'
+            success_msg: "Workload {{ workload.workload.name }} is ready on {{ workload.workload.context }}."
+          when: workload is defined
+
+        # timezone is the zone of 'start' and of the returned times, not the
+        # array's own zone; UTC matches audit_start.
+        - name: "8 · Verify | Audit trail for this run"
+          everpure.flasharray.purefa_audits:
+            start: "{{ audit_start }}"
+            timezone: UTC
+          register: audit
+
+        - name: "8 · Verify | Show the audit events from this run"
+          ansible.builtin.debug:
+            msg: |-
+              {% for e in audit.purefa_audits.values() | list | sort(attribute='time') %}
+              {% set who = (e.user | default('-', true)) | string %}
+              {% set what = (e.command | default('', true)) ~ ' ' ~ (e.subcommand | default('', true)) %}
+              {% set args = (e.arguments | default('', true)) | string | truncate(80) %}
+              {{ e.time }}  {{ who }}  {{ what }}  {{ args }}
+              {% endfor %}
+          when: audit.purefa_audits | length > 0
+
+        # The OpenMetrics exporter needs Purity//FA 6.7+ and API-token
+        # authentication. purefa_metrics is the one module here that honours
+        # https_proxy from the shell, hence the no_proxy override.
+        - name: "8 · Verify | Metrics"
+          environment:
+            no_proxy: "*"
+            NO_PROXY: "*"
+          block:
+            - name: "8 · Verify | Read volume metrics"
+              everpure.flasharray.purefa_metrics:
+                subset: volumes
+                timeout: 15
+              register: volume_metrics
+
+            - name: "8 · Verify | Read hardware health"
+              everpure.flasharray.purefa_metrics:
+                subset: array
+                metrics: [purefa_hw_component_status]
+                timeout: 15
+              register: hardware
+
+            - name: "8 · Verify | Volume performance for the demo volumes"
+              ansible.builtin.debug:
+                msg: |-
+                  {% for metric, data in volume_metrics.purefa_metrics.items() if metric.startswith('purefa_volume_performance') %}
+                  {% for s in data.samples if s.labels.get('name') in demo_volume_fqn %}
+                  {{ s.labels.get('name') }}  {{ metric | replace('purefa_volume_performance_', '') }}  {{ s.labels.get('dimension', '') }} = {{ s.value }}
+                  {% endfor %}
+                  {% endfor %}
+
+            # Empty bays and unused ports report not_installed on a healthy array.
+            - name: "8 · Verify | Hardware components not reporting ok"
+              ansible.builtin.debug:
+                msg: >-
+                  {{ hardware.purefa_metrics.purefa_hw_component_status.samples
+                     | rejectattr('labels.component_status', 'in', ['ok', 'not_installed'])
+                     | map(attribute='labels.component_name') | list
+                     | default([], true) | join(', ') | default('none', true) }}
+          rescue:
+            - name: "8 · Verify | Metrics unavailable"
+              ansible.builtin.debug:
+                msg: >-
+                  Skipped metrics: {{ ansible_failed_result.msg | default('no detail') }}
+                  (The exporter needs Purity//FA 6.7 or later and an API token in
+                  PUREFA_API; ID tokens are not accepted.)
+
+        - name: "8 · Verify | Pause"
+          ansible.builtin.pause:
+            prompt: "Step 8 · Verify done: read-back, audit trail and metrics shown. That is the whole demo; press Enter to finish"
+          when: demo_pause | bool
+
+    # =========================================================================
+    # Teardown (never runs by default): ansible-playbook ... --tags teardown
+    # Reverse order, so nothing is removed while something still depends on it.
+    # Safe to run again: each array task is guarded by what is actually left.
+    # =========================================================================
+    - name: Teardown - remove everything this demo created
+      tags: [teardown, never]
+      block:
+        - name: "Teardown | What is left on the array"
+          everpure.flasharray.purefa_info:
+            gather_subset: [pgroups]
+          register: teardown_info
+
+        - name: "Teardown | Is this array in a fleet?"
+          block:
+            - name: "Teardown | Read the fleet"
+              everpure.flasharray.purefa_info:
+                gather_subset: [fleet]
+              register: teardown_fleet
+          rescue:
+            - name: "Teardown | Fusion is not enabled on this array"
+              ansible.builtin.set_fact:
+                teardown_fleet: { purefa_info: { fleet: {} } }
+
+        # No context named, so this removes the workload wherever Fusion placed it.
+        # The name is specific to this demo; add --check first to see which member
+        # would lose it. purefa_workload refuses to run at all on a non-fleet array,
+        # and a token without fleet rights gets a 403; neither should stop the
+        # rest of the teardown.
+        - name: "Teardown | Delete and eradicate the workload, then the demo preset"
+          block:
+            - name: "Teardown | Delete and eradicate the workload"
+              everpure.flasharray.purefa_workload:
+                name: "{{ demo_workload }}"
+                state: absent
+                eradicate: true
+              when: teardown_fleet.purefa_info.fleet | default({}) | length > 0
+
+            # Only the preset this playbook created; one named with -e demo_preset
+            # belongs to someone else.
+            - name: "Teardown | Delete the demo preset"
+              everpure.flasharray.purefa_preset:
+                name: "{{ demo_preset_name }}"
+                state: absent
+              when:
+                - teardown_fleet.purefa_info.fleet | default({}) | length > 0
+                - demo_preset | length == 0
+          rescue:
+            - name: "Teardown | Workload or preset not removed, carrying on"
+              ansible.builtin.debug:
+                msg: >-
+                  Fleet objects were not all removed:
+                  {{ ansible_failed_result.msg | default('no detail') }}.
+                  Remove the workload {{ demo_workload }} and preset {{ demo_preset_name }}
+                  in Fusion if they exist; the rest of the teardown continues.
+
+        # Every snapshot of the group, not just demo-baseline: the schedule from
+        # step 6 adds one an hour.
+        - name: "Teardown | Delete and eradicate the protection group snapshots"
+          everpure.flasharray.purefa_pgsnap:
+            name: "{{ realm_pgroup }}"
+            suffix: "{{ item[(realm_pgroup | length) + 1 :] }}"
+            state: absent
+            eradicate: true
+          loop: "{{ teardown_info.purefa_info.pgroups[realm_pgroup].snaps | default({}) | list
+                    if realm_pgroup in teardown_info.purefa_info.pgroups else [] }}"
+
+        - name: "Teardown | Delete and eradicate the protection group"
+          everpure.flasharray.purefa_pg:
+            name: "{{ realm_pgroup }}"
+            state: absent
+            eradicate: true
+
+        # Pass no host/volume list here: with either list, purefa_hg state=absent
+        # only removes those members and keeps the group.
+        - name: "Teardown | Delete the host group, which disconnects the volumes"
+          everpure.flasharray.purefa_hg:
+            name: "{{ realm_hostgroup }}"
+            state: absent
+
+        - name: "Teardown | Delete and eradicate the volumes"
+          everpure.flasharray.purefa_volume:
+            name: "{{ item }}"
+            state: absent
+            eradicate: true
+          loop: "{{ demo_volume_fqn }}"
+
+        - name: "Teardown | Delete the hosts"
+          everpure.flasharray.purefa_host:
+            name: "{{ item }}"
+            state: absent
+          loop: "{{ demo_host_fqn }}"
+
+        # delete_contents is a safety net for anything created in the pod by hand
+        # during the demo; the tasks above should already have emptied it.
+        - name: "Teardown | Delete and eradicate the pod"
+          everpure.flasharray.purefa_pod:
+            name: "{{ realm_pod }}"
+            state: absent
+            eradicate: true
+            delete_contents: true
+
+        # Mirror of step 3: the policy that scopes the realm goes before the realm.
+        - name: "Teardown | Delete the access policy"
+          everpure.flasharray.purefa_policy_management_access:
+            name: "{{ demo_policy }}"
+            state: absent
+
+        - name: "Teardown | Delete and eradicate the realm"
+          everpure.flasharray.purefa_realm:
+            name: "{{ demo_realm }}"
+            state: absent
+            eradicate: true
+
+        - name: "Teardown | Delete the API client"
+          everpure.flasharray.purefa_apiclient:
+            name: "{{ demo_api_client }}"
+            state: absent
+
+        - name: "Teardown | Remove the local demo key pair"
+          ansible.builtin.file:
+            path: "{{ demo_key_dir }}"
+            state: absent
