@@ -3,7 +3,7 @@
 # From an empty array to protected, fleet-placed storage in eight steps
 # =============================================================================
 # Live demo playbook for everpure.flasharray 1.46.0+
-#   (purefa_metrics is new in 1.46.0. Ansible resolves every module when it
+#   (purefa_preset and purefa_metrics are new in 1.46.0. Ansible resolves every module when it
 #    loads the play, so an older collection refuses to parse this file at all,
 #    whatever --tags you pass.)
 # Target: Everpure Cloud Dedicated trial or a lab FlashArray

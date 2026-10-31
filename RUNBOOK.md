@@ -45,7 +45,7 @@ export PUREFA_URL=<array management address>
 export PUREFA_API=<API token of the fleet-wide user>
 ```
 
-The collection must include `purefa_preset`. Ansible resolves every module when it loads the play, so an older collection refuses to parse the file at all, whatever tags you pass. `openssl` must be on the controller: step 2 generates a throwaway key pair under `~/.everpure-demo`.
+`purefa_preset` and `purefa_metrics` arrived in 1.46.0. Ansible resolves every module when it loads the play, so an older collection refuses to parse the file at all, whatever tags you pass. `openssl` must be on the controller: step 2 generates a throwaway key pair under `~/.everpure-demo`.
 
 ### Variables to look at
 
@@ -135,7 +135,7 @@ Teardown works in reverse order: workload and demo preset, every snapshot of the
 
 | You see | Cause | Do |
 |---|---|---|
-| `couldn't resolve module/action everpure.flasharray.purefa_preset` before anything runs | Collection older than 1.46.0, or 1.46.0 without the preset module | Reinstall from `requirements.yml`; `ansible-doc everpure.flasharray.purefa_preset` must work. |
+| `couldn't resolve module/action everpure.flasharray.purefa_preset` before anything runs | Collection older than 1.46.0 | Reinstall from `requirements.yml`; `ansible-galaxy collection list everpure.flasharray` must show 1.46.0 or later. |
 | Step 1 assertion: "negotiated REST x.y ... need 2.40" | Array too old, or py-pure-client older than the array | Upgrade Purity past 6.8.2, or upgrade py-pure-client. |
 | Step 7: `Failed to read workload ... status_code 403`, or the preset create is refused with a directory-identity hint | `PUREFA_API` is a local array user's token | Use a token for a directory-service user known to every fleet member. |
 | Step 7: `Recommendation calculation failure. Error: No viable targets` | No fleet member offers `demo_storage_class`, or the preset needs parameters | Set `-e demo_storage_class=flasharray-c` (or the right class); with `-e demo_preset` pick a simpler preset. |
@@ -169,7 +169,7 @@ Tags: `step1` to `step8` (also `discover`, `identity`, `tenant`, `hosts`, `volum
 ## 8. Validation record
 
 - Date: 31 October 2026
-- Collection: everpure.flasharray master 11e9dce (1.46.0 release candidate, PR 1098 merged) plus PR 1099 `purefa_preset`
+- Collection: everpure.flasharray 1.46.0
 - Target: fleet of two FlashArrays, Purity//FA 6.10.6, REST 2.54 negotiated, py-pure-client 1.94.1, ansible-core 2.17.9
 - Identity: directory-service user known to both members
 - Full run: run 1 37 tasks ok, 16 changed, 0 failed; run 2 0 changed; teardown 1 12 changed, 0 failed; teardown 2 0 changed, 0 failed; no objects left on either member

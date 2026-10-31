@@ -44,7 +44,7 @@ The runbook has the full list, a rehearsal checklist, and a troubleshooting tabl
 
 ## Status
 
-Validated on 31 October 2026 against a two-array fleet on Purity//FA 6.10.6 (REST 2.54) with collection master for 1.46.0 plus the `purefa_preset` module: full run, idempotent re-run (0 changes), teardown twice (second one 0 changes, 0 failures), nothing left on either array. Details in the runbook's validation record.
+Validated on 31 October 2026 against a two-array fleet on Purity//FA 6.10.6 (REST 2.54) with everpure.flasharray 1.46.0: full run, idempotent re-run (0 changes), teardown twice (second one 0 changes, 0 failures), nothing left on either array. Details in the runbook's validation record.
 
 ## Notes
 
